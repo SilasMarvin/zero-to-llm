@@ -7,6 +7,30 @@ const VOCAB_SIZE: usize = 32000;
 const HIDDEN_SIZE: usize = 64;
 const DECODER_BLOCKS: usize = 1;
 
+fn generate_positional_embeddings<D: Device<f32>>(
+    batch_size: usize,
+    len: usize,
+    dev: &D,
+) -> Tensor<(usize, usize, Const<HIDDEN_SIZE>), f32, D> {
+    // We can only index on the CPU
+    // Shoutout to https://machinelearningmastery.com/a-gentle-introduction-to-positional-encoding-in-transformer-models-part-1/
+    let cpu_dev: Cpu = Default::default();
+    let mut positional_embeddings: Tensor<(usize, Const<64>), f32, Cpu> =
+        cpu_dev.ones_like(&(len, Const));
+    for k in 0..len {
+        for i in 0..HIDDEN_SIZE / 2 {
+            let denominator = 10000.0_f32.powf(2. * (i as f32 / (HIDDEN_SIZE as f32)));
+            positional_embeddings[[k, 2 * i]] = (k as f32 / denominator).sin();
+            positional_embeddings[[k, 2 * i + 1]] = (k as f32 / denominator).cos();
+        }
+    }
+    let positional_embeddings = positional_embeddings.to_device(dev);
+    (0..batch_size)
+        .map(|_i| positional_embeddings.clone())
+        .collect::<Vec<Tensor<(usize, Const<HIDDEN_SIZE>), f32, D>>>()
+        .stack()
+}
+
 struct DecoderBlock<D: Device<f32>> {
     dev: D,
     qkv_weights: Tensor<Rank2<HIDDEN_SIZE, { HIDDEN_SIZE * 3 }>, f32, D>,
@@ -27,25 +51,30 @@ impl<D: Device<f32>> DecoderBlock<D> {
 
     fn forward<T: Tape<f32, D> + std::fmt::Debug>(
         &mut self,
-        input: Tensor<(usize, Const<HIDDEN_SIZE>), f32, D, T>,
-    ) -> Tensor<(usize, Const<HIDDEN_SIZE>), f32, D, T> {
+        input: Tensor<(usize, usize, Const<HIDDEN_SIZE>), f32, D, T>,
+    ) -> Tensor<(usize, usize, Const<HIDDEN_SIZE>), f32, D, T> {
         let qkv_proj = input.matmul(self.qkv_weights.clone());
-        let q_proj: Tensor<(usize, Const<HIDDEN_SIZE>), f32, D, T> =
-            qkv_proj.retaped().slice((0.., 0..HIDDEN_SIZE)).realize();
-        let k_proj: Tensor<(usize, Const<HIDDEN_SIZE>), f32, D, T> = qkv_proj
+        let q_proj: Tensor<(usize, usize, Const<HIDDEN_SIZE>), f32, D, T> = qkv_proj
             .retaped()
-            .slice((0.., HIDDEN_SIZE..HIDDEN_SIZE * 2))
+            .slice((0.., 0.., 0..HIDDEN_SIZE))
             .realize();
-        let k_proj: Tensor<(Const<HIDDEN_SIZE>, usize), f32, D, T> = k_proj.permute();
-        let v_proj: Tensor<(usize, Const<HIDDEN_SIZE>), f32, D, T> = qkv_proj
-            .slice((0.., HIDDEN_SIZE * 2..HIDDEN_SIZE * 3))
+        let k_proj: Tensor<(usize, usize, Const<HIDDEN_SIZE>), f32, D, T> = qkv_proj
+            .retaped()
+            .slice((0.., 0.., HIDDEN_SIZE..HIDDEN_SIZE * 2))
             .realize();
-        let scores: Tensor<(usize, usize), f32, D, T> = q_proj.matmul(k_proj);
-        let mask: Tensor<(usize, usize), f32, D> = self.dev.upper_tri_like(&scores, f32::MIN, 1);
-        let masked_scores: Tensor<(usize, usize), f32, D, T> = scores + mask;
-        let softmaxed_scores: Tensor<(usize, usize), f32, D, T> =
-            masked_scores.softmax::<Axis<1>>();
-        let f: Tensor<(usize, Const<HIDDEN_SIZE>), f32, D, T> = softmaxed_scores.matmul(v_proj);
+        let k_proj: Tensor<(usize, Const<HIDDEN_SIZE>, usize), f32, D, T> =
+            k_proj.permute::<_, Axes3<0, 2, 1>>();
+        let v_proj: Tensor<(usize, usize, Const<HIDDEN_SIZE>), f32, D, T> = qkv_proj
+            .slice((0.., 0.., HIDDEN_SIZE * 2..HIDDEN_SIZE * 3))
+            .realize();
+        let scores: Tensor<(usize, usize, usize), f32, D, T> = q_proj.matmul(k_proj);
+        let mask: Tensor<(usize, usize, usize), f32, D> =
+            self.dev.upper_tri_like(&scores, f32::MIN, 1);
+        let masked_scores: Tensor<(usize, usize, usize), f32, D, T> = scores + mask;
+        let softmaxed_scores: Tensor<(usize, usize, usize), f32, D, T> =
+            masked_scores.softmax::<Axis<2>>();
+        let f: Tensor<(usize, usize, Const<HIDDEN_SIZE>), f32, D, T> =
+            softmaxed_scores.matmul(v_proj);
         f.matmul(self.linear_weights.clone())
     }
 
@@ -83,83 +112,95 @@ impl<D: Device<f32>> Model<D> {
         }
     }
 
-    fn forward(&mut self, token_ids: Vec<usize>) -> Result<usize> {
-        // Generate the positional embeddings
-        let positional_embeddings: Tensor<(usize, Const<64>), f32, _> = self
-            .dev
-            .one_hot_encode(Const::<64>, (0..token_ids.len()).collect::<Vec<usize>>());
+    fn forward(&mut self, token_ids: Vec<Vec<usize>>) -> Result<Vec<usize>> {
+        let positional_embeddings =
+            generate_positional_embeddings(token_ids.len(), token_ids[0].len(), &self.dev);
 
-        // Generate the token embeddings
-        let embedding_inputs: Tensor<(usize, Const<32000>), f32, _> =
-            self.dev.one_hot_encode(Const::<32000>, token_ids.clone());
-        let token_embeddings: Tensor<(usize, Const<HIDDEN_SIZE>), f32, D> =
+        let embedding_inputs: Vec<Tensor<(usize, Const<32000>), f32, _>> = token_ids
+            .iter()
+            .map(|t| self.dev.one_hot_encode(Const::<32000>, t.clone()))
+            .collect();
+        let embedding_inputs: Tensor<(usize, usize, Const<32000>), f32, _> =
+            embedding_inputs.stack();
+
+        let token_embeddings: Tensor<(usize, usize, Const<HIDDEN_SIZE>), f32, D> =
             embedding_inputs.matmul(self.embed_weights.clone());
 
         // Add them together to get the final embeddings matrix
-        let mut x: Tensor<(usize, Const<HIDDEN_SIZE>), f32, D> =
+        let mut x: Tensor<(usize, usize, Const<HIDDEN_SIZE>), f32, D> =
             token_embeddings + positional_embeddings;
 
         // Iterate through our decode layers
         for layer in self.decoder_blocks.iter_mut() {
-            x = layer.forward(x);
+            x = x.retaped() + layer.forward(x);
         }
 
         // Get the final output
         let logits = x.matmul(self.projection_weights.clone());
 
-        // Get the predicted token
+        // Get the predicted tokens
         // We don't care about the logits for the other word predictions, just the last one
         // While training, we do care about the logits for other word predictions
-        let predicted_tokens: Tensor<Rank2<1, VOCAB_SIZE>, f32, D> = logits
-            .slice((token_ids.len() - 1.., 0..VOCAB_SIZE))
-            .realize();
-
-        // I don't think dfdx has an argmax function so we do it ourselves
-        let token_id = predicted_tokens
-            .as_vec()
-            .iter()
-            .enumerate()
-            .fold((0, f32::MIN), |(best_index, best_value), (index, value)| {
-                if *value > best_value {
-                    (index, *value)
-                } else {
-                    (best_index, best_value)
-                }
-            })
-            .0;
-        Ok(token_id)
+        let mut predicted_tokens = vec![];
+        for i in 0..token_ids.len() {
+            let predicted_token = logits
+                .clone()
+                .slice((i..i + 1, token_ids[0].len() - 1.., 0..))
+                .as_vec()
+                .iter()
+                .enumerate()
+                .fold((0, f32::MIN), |(best_index, best_value), (index, value)| {
+                    if *value > best_value {
+                        (index, *value)
+                    } else {
+                        (best_index, best_value)
+                    }
+                })
+                .0;
+            predicted_tokens.push(predicted_token);
+        }
+        Ok(predicted_tokens)
     }
 
-    // Will probably want to make this take a batch in the future
-    fn train(&mut self, token_ids: Vec<usize>, labels: Vec<usize>) -> Result<f32> {
+    fn train(&mut self, token_ids: Vec<Vec<usize>>, labels: Vec<Vec<usize>>) -> Result<f32> {
         let grads = Gradients::leaky();
 
-        // Generate the positional embeddings
-        let positional_embeddings: Tensor<(usize, Const<64>), f32, D> = self
-            .dev
-            .one_hot_encode(Const::<64>, (0..token_ids.len()).collect::<Vec<usize>>());
+        let positional_embeddings =
+            generate_positional_embeddings(token_ids.len(), token_ids[0].len(), &self.dev);
 
         // Generate the token embeddings
-        let embedding_inputs: Tensor<(usize, Const<32000>), f32, _> =
-            self.dev.one_hot_encode(Const::<32000>, token_ids);
-        let token_embeddings: Tensor<(usize, Const<HIDDEN_SIZE>), f32, D, OwnedTape<f32, D>> =
-            embedding_inputs
-                .trace(grads)
-                .matmul(self.embed_weights.clone());
+        let embedding_inputs: Vec<Tensor<(usize, Const<32000>), f32, _>> = token_ids
+            .iter()
+            .map(|t| self.dev.one_hot_encode(Const::<32000>, t.clone()))
+            .collect();
+        let embedding_inputs: Tensor<(usize, usize, Const<32000>), f32, _> =
+            embedding_inputs.stack();
+
+        let token_embeddings: Tensor<
+            (usize, usize, Const<HIDDEN_SIZE>),
+            f32,
+            D,
+            OwnedTape<f32, D>,
+        > = embedding_inputs
+            .trace(grads)
+            .matmul(self.embed_weights.clone());
 
         // Add them together to get the final embeddings matrix
-        let mut x: Tensor<(usize, Const<HIDDEN_SIZE>), f32, D, OwnedTape<f32, D>> =
+        let mut x: Tensor<(usize, usize, Const<HIDDEN_SIZE>), f32, D, OwnedTape<f32, D>> =
             token_embeddings + positional_embeddings;
 
         // Iterate through our decode layers
         for layer in self.decoder_blocks.iter_mut() {
-            x = layer.forward(x);
+            x = x.retaped() + layer.forward(x);
         }
 
         // Calculate the loss
         let logits = x.matmul(self.projection_weights.clone());
-        let labels: Tensor<(usize, Const<32000>), f32, _> =
-            self.dev.one_hot_encode(Const::<32000>, labels);
+        let labels: Vec<Tensor<(usize, Const<32000>), f32, _>> = labels
+            .into_iter()
+            .map(|l| self.dev.one_hot_encode(Const::<32000>, l))
+            .collect();
+        let labels: Tensor<(usize, usize, Const<32000>), f32, _> = labels.stack();
         let loss = cross_entropy_with_logits_loss(logits, labels);
 
         // Store the loss before going backwards so we can return it
@@ -201,13 +242,13 @@ fn main() -> Result<()> {
     let dev: Cuda = Default::default();
     let mut model = Model::new(dev);
 
-    let labels = vec![29902, 338, 2675, 304, 1735];
-    for i in 0..10000 {
-        let loss = model.train(token_ids.clone(), labels.clone())?;
+    let labels = vec![vec![29902, 338, 2675, 304, 1735]];
+    for i in 0..2500 {
+        let loss = model.train(vec![token_ids.clone()], labels.clone())?;
         println!("{i} - {loss}");
     }
 
-    let output = model.forward(vec![319])?;
+    let output = model.forward(vec![vec![319]])?;
     println!("{:?}", output);
 
     Ok(())
